@@ -106,7 +106,17 @@ def import_dxf_background(filepath):
     bg_item = DxfBackgroundItem(filepath)
     pen = QPen(QColor(150, 150, 150, 180), 1) # 背景用に少し薄く表示
     
-    for e in msp.virtual_entities():
+    entities = []
+    for e in msp:
+        if e.dxftype() == 'INSERT' and hasattr(e, 'virtual_entities'):
+            try:
+                entities.extend(e.virtual_entities())
+            except Exception:
+                pass
+        else:
+            entities.append(e)
+            
+    for e in entities:
         if e.dxftype() == 'LINE':
             item = QGraphicsLineItem(e.dxf.start.x, -e.dxf.start.y, e.dxf.end.x, -e.dxf.end.y)
             item.setPen(pen)
