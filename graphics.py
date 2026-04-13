@@ -90,15 +90,6 @@ class FlowchartView(QGraphicsView):
             self.scene().hide_preview_node()
         super().leaveEvent(event)
 
-class DxfBackgroundItem(QGraphicsItemGroup):
-    """DXFインポートされた背景図形（図枠など）を管理するグループアイテム"""
-    def __init__(self, filepath):
-        super().__init__()
-        self.filepath = filepath
-        self.setZValue(-100) # 最背面に設定
-        # CADの図枠として扱うため、移動や選択を不可にする
-        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
-
 class NodeItem(QGraphicsPathItem):
     def __init__(self, x, y, text="Node", node_type="process", node_id=None, bg_color="#E1F5FE", text_color="#000000", w=100, h=50, line_color=None):
         super().__init__()
@@ -685,3 +676,31 @@ class FlowchartScene(QGraphicsScene):
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace): self.main_window.delete_selected_items()
         super().keyPressEvent(event)
+
+class DxfFrameItem(QGraphicsItemGroup):
+    """DXF図面枠を表示するためのグループアイテム"""
+    def __init__(self, entities):
+        super().__init__()
+        for item in entities:
+            self.addToGroup(item)
+        
+        self.setZValue(-100) # かなり後ろに配置
+        self._locked = True
+        self.set_locked(True)
+
+    def set_locked(self, locked):
+        self._locked = locked
+        if locked:
+            self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemHasNoContents) # ヒットテストを無効化に近い状態
+            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        else:
+            self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable | QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemHasNoContents, False)
+
+    def paint(self, painter, option, widget=None):
+        if not self._locked and self.isSelected():
+            # 選択中は枠線を表示（QGraphicsItemGroupはデフォルトで描画しないため）
+            painter.setPen(QPen(QColor("#FF5722"), 2, Qt.PenStyle.DashLine))
+            painter.drawRect(self.boundingRect())
+        super().paint(painter, option, widget)

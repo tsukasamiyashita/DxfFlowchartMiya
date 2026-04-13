@@ -25,8 +25,8 @@ import darkdetect
 
 from graphics import (GRID_SIZE, SceneStateCommand, FlowchartView, 
                       NodeItem, WaypointItem, EdgeItem, FlowchartScene, 
-                      DxfBackgroundItem, clip_line_to_node)
-from dxf_io import export_dxf_file, import_dxf_background
+                      clip_line_to_node, DxfFrameItem)
+from dxf_io import export_dxf_file, import_dxf_as_items
 
 class ToolTipDelayStyle(QProxyStyle):
     def styleHint(self, hint, option=None, widget=None, returnData=None):
@@ -153,7 +153,10 @@ class MainWindow(QMainWindow):
         self.clipboard_data = None
         self.clipboard_base_pos = None
         self.undo_stack = QUndoStack(self)
-        self.last_state = {"nodes": [], "edges": [], "groups": [], "dxf_backgrounds": []}
+        self.dxf_template_path = None
+        self.dxf_template_scale = 1.0
+        self.frame_item = None
+        self.last_state = {"nodes": [], "edges": [], "groups": [], "dxf_template_path": None, "dxf_template_pos": None, "dxf_template_scale": 1.0}
         self.is_light_theme = not darkdetect.isDark()
 
         self.scene = FlowchartScene(self)
@@ -295,7 +298,11 @@ class MainWindow(QMainWindow):
         self.scene.update()
 
     def get_scene_json(self, selected_only=False):
-        data = {"nodes": [], "edges": [], "groups": [], "dxf_backgrounds": []}
+        frame_pos = None
+        if self.frame_item:
+            frame_pos = {"x": self.frame_item.scenePos().x(), "y": self.frame_item.scenePos().y()}
+        
+        data = {"nodes": [], "edges": [], "groups": [], "dxf_template_path": self.dxf_template_path, "dxf_template_pos": frame_pos, "dxf_template_scale": self.dxf_template_scale}
         items_raw = self.scene.selectedItems() if selected_only else self.scene.items()
         
         items = set()
@@ -307,9 +314,7 @@ class MainWindow(QMainWindow):
         valid_node_ids = set()
         
         for item in items:
-            if isinstance(item, DxfBackgroundItem):
-                data["dxf_backgrounds"].append({"filepath": item.filepath, "x": item.scenePos().x(), "y": item.scenePos().y()})
-            elif isinstance(item, NodeItem) and getattr(self.scene, 'preview_node', None) != item and item not in getattr(self.scene, 'preview_items', []):
+            if isinstance(item, NodeItem) and getattr(self.scene, 'preview_node', None) != item and item not in getattr(self.scene, 'preview_items', []):
                 data["nodes"].append({"id": item.node_id, "type": item.node_type, "x": item.scenePos().x(), "y": item.scenePos().y(), "w": item.w, "h": item.h, "text": item.text_item.toPlainText(), "bg_color": item.bg_color.name(), "text_color": item.text_color.name(), "line_color": item.line_color.name() if item.line_color else None, "font": item.font_family})
                 valid_node_ids.add(item.node_id)
                 
@@ -320,7 +325,7 @@ class MainWindow(QMainWindow):
                 data["edges"].append({"source": item.source_node.node_id, "target": item.target_node.node_id, "label": item.raw_text, "width": item.line_width, "style": item.line_style, "routing": item.routing, "arrow": item.arrow, "line_color": item.line_color.name() if item.line_color else None, "font": item.font_family, "waypoints": [{"x": wp.scenePos().x(), "y": wp.scenePos().y()} for wp in item.waypoints], "text_offset": offset})
                 
         for item in items:
-            if type(item) == QGraphicsItemGroup and not isinstance(item, DxfBackgroundItem):
+            if type(item) == QGraphicsItemGroup:
                 c_ids = [c.node_id for c in item.childItems() if hasattr(c, 'node_id')]
                 if c_ids: data["groups"].append(c_ids)
                 
@@ -333,14 +338,22 @@ class MainWindow(QMainWindow):
             
         id_map = {}
         
-        for bg in data.get("dxf_backgrounds", []):
-            try:
-                bg_item = import_dxf_background(bg["filepath"])
-                bg_item.setPos(bg.get("x", 0) + offset_x, bg.get("y", 0) + offset_y)
-                self.scene.addItem(bg_item)
-                self.scene.items_ref.append(bg_item)
-            except Exception as e:
-                print(f"Skipped missing DXF background: {e}")
+        self.dxf_template_path = data.get("dxf_template_path")
+        self.update_dxf_template_label()
+        
+        t_pos = data.get("dxf_template_pos")
+        pos = QPointF(t_pos["x"], t_pos["y"]) if t_pos else QPointF(0, 0)
+        self.dxf_template_scale = data.get("dxf_template_scale", 1.0)
+        self.sb_frame_scale.blockSignals(True)
+        self.sb_frame_scale.setValue(self.dxf_template_scale)
+        self.sb_frame_scale.blockSignals(False)
+        
+        if self.dxf_template_path:
+            self.load_dxf_frame(self.dxf_template_path, pos, self.dxf_template_scale)
+        elif self.frame_item:
+            self.scene.removeItem(self.frame_item)
+            self.frame_item = None
+            self.act_lock_frame.setEnabled(False)
 
         for n in data.get("nodes", []):
             new_id = str(uuid.uuid4()) if generate_new_ids else n.get("id")
@@ -385,9 +398,8 @@ class MainWindow(QMainWindow):
         for text, func, sc in [("上書き保存(&S)", self.save_file, "Ctrl+S"), ("名前を付けて保存(&A)...", self.save_file_as, "Ctrl+Shift+S"), ("読込(&O)", self.load_json, "Ctrl+O")]:
             act = QAction(text, self); act.setShortcut(sc); act.triggered.connect(func); file_menu.addAction(act)
         file_menu.addSeparator()
-        
-        file_menu.addAction("DXFを図枠(ベース)としてインポート...", self.import_dxf_as_background)
-        file_menu.addAction("DXF図枠をクリア", self.clear_dxf_background)
+        file_menu.addAction("DXF出力の図枠リンクを設定...", self.link_dxf_template)
+        file_menu.addAction("DXF図枠リンクを解除", self.clear_dxf_template)
         file_menu.addSeparator()
         
         act_excel = self.create_icon_action('fa5s.file-excel', "仕様書(Excel)生成...", self.generate_excel)
@@ -516,11 +528,29 @@ class MainWindow(QMainWindow):
                 tb_edit.addAction(act)
         
         tb_cad = QToolBar("CAD設定"); self.addToolBar(tb_cad)
+        self.lbl_dxf_template = QLabel(" 図枠リンク: [未設定] "); tb_cad.addWidget(self.lbl_dxf_template)
+        tb_cad.addSeparator()
         tb_cad.addWidget(QLabel("DXF版:")); self.cb_dxf_ver = QComboBox()
         self.cb_dxf_ver.addItems(["2007", "2010", "2013", "2018"])
         self.cb_dxf_ver.setItemData(0, "R2007"); self.cb_dxf_ver.setItemData(1, "R2010")
         self.cb_dxf_ver.setItemData(2, "R2013"); self.cb_dxf_ver.setItemData(3, "R2018")
         self.cb_dxf_ver.setCurrentIndex(1); tb_cad.addWidget(self.cb_dxf_ver)
+        
+        tb_cad.addSeparator()
+        self.act_lock_frame = self.create_icon_action('fa5s.lock', "図面枠をロック中 (クリックで解除)", self.toggle_frame_lock, checkable=True)
+        self.act_lock_frame.setChecked(True)
+        self.act_lock_frame.setEnabled(False)
+        tb_cad.addAction(self.act_lock_frame)
+        
+        tb_cad.addSeparator()
+        tb_cad.addWidget(QLabel(" 図枠倍率: "))
+        self.sb_frame_scale = QDoubleSpinBox()
+        self.sb_frame_scale.setRange(0.01, 100.0)
+        self.sb_frame_scale.setSingleStep(0.1)
+        self.sb_frame_scale.setValue(1.0)
+        self.sb_frame_scale.setEnabled(False)
+        self.sb_frame_scale.valueChanged.connect(self.change_frame_scale)
+        tb_cad.addWidget(self.sb_frame_scale)
         
         self.addToolBarBreak()
 
@@ -619,36 +649,88 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "エラー", f"自動レイアウトに失敗しました。\n{e}")
 
-    def import_dxf_as_background(self):
-        path, _ = QFileDialog.getOpenFileName(self, "DXF図枠読込", "", "DXF Files (*.dxf)")
+    def link_dxf_template(self):
+        path, _ = QFileDialog.getOpenFileName(self, "DXF出力用テンプレート指定", "", "DXF Files (*.dxf)")
         if not path: return
-        try:
-            for item in self.scene.items():
-                if isinstance(item, DxfBackgroundItem):
-                    self.scene.removeItem(item)
-                    if item in getattr(self.scene, 'items_ref', []):
-                        self.scene.items_ref.remove(item)
-            
-            bg_item = import_dxf_background(path)
-            bg_item.setPos(0, 0)
-            self.scene.addItem(bg_item)
-            self.scene.items_ref.append(bg_item)
-            self.push_undo_state("DXF図枠追加")
-            QMessageBox.information(self, "完了", "DXF図面をベース(図枠)として読み込みました。\nエクスポート時にこの図面がベースになります。")
-        except Exception as e:
-            QMessageBox.critical(self, "エラー", str(e))
+        self.dxf_template_path = path
+        self.update_dxf_template_label()
+        self.load_dxf_frame(path)
+        self.sb_frame_scale.setEnabled(True)
+        self.push_undo_state("DXF出力用テンプレート指定")
+        QMessageBox.information(self, "完了", f"テンプレートをリンクし、背景に表示しました。\n{path}")
 
-    def clear_dxf_background(self):
-        changed = False
-        for item in self.scene.items():
-            if isinstance(item, DxfBackgroundItem):
-                self.scene.removeItem(item)
-                if item in getattr(self.scene, 'items_ref', []):
-                    self.scene.items_ref.remove(item)
-                changed = True
-        if changed:
-            self.push_undo_state("DXF図枠クリア")
-            QMessageBox.information(self, "完了", "DXF図枠をクリアしました。")
+    def clear_dxf_template(self):
+        if self.dxf_template_path:
+            self.dxf_template_path = None
+            self.update_dxf_template_label()
+            self.push_undo_state("DXF出力用テンプレート解除")
+            QMessageBox.information(self, "完了", "設定したテンプレートリンクを解除しました。")
+            if self.frame_item:
+                self.scene.removeItem(self.frame_item)
+                self.frame_item = None
+            self.act_lock_frame.setEnabled(False)
+            self.sb_frame_scale.setValue(1.0)
+            self.sb_frame_scale.setEnabled(False)
+
+    def load_dxf_frame(self, path, pos=QPointF(0, 0), scale=1.0):
+        if self.frame_item:
+            self.scene.removeItem(self.frame_item)
+            self.frame_item = None
+            
+        items = import_dxf_as_items(path)
+        if items:
+            self.frame_item = DxfFrameItem(items)
+            self.scene.addItem(self.frame_item)
+            self.frame_item.setPos(pos)
+            self.frame_item.setScale(scale)
+            self.act_lock_frame.setEnabled(True)
+            self.act_lock_frame.setChecked(True)
+            self.sb_frame_scale.setEnabled(True)
+            self.sb_frame_scale.blockSignals(True)
+            self.sb_frame_scale.setValue(scale)
+            self.sb_frame_scale.blockSignals(False)
+            self.frame_item.set_locked(True)
+            self.update_frame_lock_icon()
+        else:
+            QMessageBox.warning(self, "警告", "DXFの読み込みに失敗したか、有効なエンティティがありませんでした。")
+
+    def change_frame_scale(self):
+        if self.frame_item:
+            self.dxf_template_scale = self.sb_frame_scale.value()
+            self.frame_item.setScale(self.dxf_template_scale)
+            self.push_undo_state("図面枠の倍率変更")
+
+    def toggle_frame_lock(self):
+        if self.frame_item:
+            locked = self.act_lock_frame.isChecked()
+            self.frame_item.set_locked(locked)
+            self.update_frame_lock_icon()
+            msg = "図面枠をロックしました。" if locked else "図面枠のロックを解除しました。ドラッグで移動できます。"
+            self.statusBar().showMessage(msg, 3000)
+
+    def update_frame_lock_icon(self):
+        locked = self.act_lock_frame.isChecked()
+        icon = 'fa5s.lock' if locked else 'fa5s.lock-open'
+        text = "図面枠をロック中" if locked else "図面枠を移動可能"
+        self.act_lock_frame.setText(text)
+        # アイコンを更新（apply_themeと同様のロジック）
+        icon_color = '#212529' if self.is_light_theme else '#F8F9FA'
+        self.act_lock_frame.setIcon(qta.icon(icon, color=icon_color))
+        # 既存のicon_actionsリストも更新しておく
+        for i, (act, _) in enumerate(self.icon_actions):
+            if act == self.act_lock_frame:
+                self.icon_actions[i] = (act, icon)
+                break
+
+    def update_dxf_template_label(self):
+        if hasattr(self, 'lbl_dxf_template'):
+            if self.dxf_template_path:
+                name = os.path.basename(self.dxf_template_path)
+                self.lbl_dxf_template.setText(f" 図枠リンク中: {name} ")
+                self.lbl_dxf_template.setStyleSheet("background-color: #E3F2FD; color: #1565C0; font-weight: bold; padding: 2px; border-radius: 4px;")
+            else:
+                self.lbl_dxf_template.setText(" 図枠リンク: [未設定] ")
+                self.lbl_dxf_template.setStyleSheet("color: gray;")
 
     def generate_excel(self):
         default_name = datetime.datetime.now().strftime("%Y%m%d")
@@ -791,7 +873,7 @@ class MainWindow(QMainWindow):
     def ungroup_selected(self):
         changed = False
         for item in self.scene.selectedItems():
-            if type(item) == QGraphicsItemGroup and not isinstance(item, DxfBackgroundItem):
+            if type(item) == QGraphicsItemGroup:
                 self.scene.destroyItemGroup(item)
                 if item in self.scene.items_ref: self.scene.items_ref.remove(item)
                 changed = True
@@ -849,12 +931,11 @@ class MainWindow(QMainWindow):
     def delete_selected_items(self):
         sel = self.scene.selectedItems()
         if not sel: return
-        edges, nodes, wps, bgs = set(), set(), set(), set()
+        edges, nodes, wps = set(), set(), set()
         for i in sel:
-            if type(i) == QGraphicsItemGroup and not isinstance(i, DxfBackgroundItem): 
+            if type(i) == QGraphicsItemGroup: 
                 self.ungroup_selected(); return 
-            if isinstance(i, DxfBackgroundItem): bgs.add(i)
-            elif isinstance(i, NodeItem): nodes.add(i); edges.update(i.edges)
+            if isinstance(i, NodeItem): nodes.add(i); edges.update(i.edges)
             elif isinstance(i, EdgeItem): edges.add(i)
             elif isinstance(i, WaypointItem): wps.add(i)
             
@@ -937,7 +1018,7 @@ class MainWindow(QMainWindow):
                 self.scene.render(p, QRectF(printer.pageRect(QPrinter.Unit.DevicePixel)), rect)
                 p.end()
             elif path.endswith('.dxf'): 
-                export_dxf_file(self.scene, path, self.cb_dxf_ver.currentData())
+                export_dxf_file(self.scene, path, self.cb_dxf_ver.currentData(), self.dxf_template_path)
             elif path.endswith('.md'): self._export_mermaid(path)
         self.scene.draw_grid = old_grid
         for i in hidden: i.show()
@@ -979,7 +1060,7 @@ class MainWindow(QMainWindow):
             try:
                 if item == getattr(self.scene, 'preview_node', None) or item in getattr(self.scene, 'preview_items', []): is_preview = True
             except RuntimeError: pass
-            if is_preview or isinstance(item, DxfBackgroundItem): continue
+            if is_preview: continue
             
             if isinstance(item, NodeItem):
                 x, y = item.scenePos().x(), -item.scenePos().y(); t = item.node_type
