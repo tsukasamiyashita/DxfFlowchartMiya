@@ -1,10 +1,10 @@
-# tsukasamiyashita/dxfflowchartmiya/DxfFlowchartMiya-1559b301efcf479ed8934d5e23d0d8559520cac5/graphics.py
+# tsukasamiyashita/dxfflowchartmiya/DxfFlowchartMiya-dac99957653817cc9b44f6154480ff40d3256b04/graphics.py
 import uuid
 import math
 from PyQt6.QtWidgets import (QGraphicsScene, QGraphicsView, QGraphicsPathItem, 
                              QGraphicsTextItem, QGraphicsItem, QGraphicsEllipseItem, 
-                             QGraphicsItemGroup, QDialog, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QTextEdit, QPushButton, QStyle)
+                             QGraphicsItemGroup, QDialog, QVBoxLayout, QGraphicsLineItem,
+                             QHBoxLayout, QLabel, QTextEdit, QPushButton, QStyle, QStyleOptionGraphicsItem)
 from PyQt6.QtCore import Qt, QRectF, QPointF, QLineF
 from PyQt6.QtGui import (QPen, QBrush, QColor, QPainter, QPainterPath, 
                          QPainterPathStroker, QTransform, QUndoCommand, QPolygonF)
@@ -70,13 +70,16 @@ class SceneStateCommand(QUndoCommand):
 class FlowchartView(QGraphicsView):
     def __init__(self, scene):
         super().__init__(scene)
-        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setRenderHints(QPainter.RenderHint.Antialiasing | 
+                           QPainter.RenderHint.TextAntialiasing | 
+                           QPainter.RenderHint.SmoothPixmapTransform)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.zoom_factor = 1.15
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setRubberBandSelectionMode(Qt.ItemSelectionMode.IntersectsItemShape)
-        self.setMouseTracking(True) 
+        self.setMouseTracking(True)
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate) # 描画精度優先
 
     def wheelEvent(self, event):
         if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
@@ -186,7 +189,9 @@ class NodeItem(QGraphicsPathItem):
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and self.scene():
-            return QPointF(round(value.x()/GRID_SIZE)*GRID_SIZE, round(value.y()/GRID_SIZE)*GRID_SIZE)
+            if getattr(self.scene(), 'snap_to_grid', True):
+                return QPointF(round(value.x()/GRID_SIZE)*GRID_SIZE, round(value.y()/GRID_SIZE)*GRID_SIZE)
+            return value
         elif change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             for edge in self.edges: edge.update_position()
         elif change == QGraphicsItem.GraphicsItemChange.ItemSceneHasChanged:
@@ -221,7 +226,9 @@ class WaypointItem(QGraphicsEllipseItem):
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and self.scene():
-            return QPointF(round(value.x()/GRID_SIZE)*GRID_SIZE, round(value.y()/GRID_SIZE)*GRID_SIZE)
+            if getattr(self.scene(), 'snap_to_grid', True):
+                return QPointF(round(value.x()/GRID_SIZE)*GRID_SIZE, round(value.y()/GRID_SIZE)*GRID_SIZE)
+            return value
         elif change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             self.edge.update_position()
         return super().itemChange(change, value)
@@ -492,6 +499,154 @@ class EdgeItem(QGraphicsPathItem):
         if dist < 15.0 and 0 <= dot <= length ** 2: self.remove_waypoint(wp)
         self.scene().main_window.push_undo_state("線の変形")
 
+# === CAD Items ===
+
+class CadBase:
+    def init_cad(self, color, layer, node_id):
+        self.is_cad_item = True
+        self.cad_color = QColor(color)
+        self.cad_layer = layer
+        self.node_id = node_id if node_id else str(uuid.uuid4())
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable | QGraphicsItem.GraphicsItemFlag.ItemIsMovable | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.cad_width = 1
+
+    def set_cad_color(self, color):
+        self.cad_color = color
+        if hasattr(self, 'setPen') and not isinstance(self, QGraphicsTextItem):
+            pen = self.pen()
+            pen.setColor(color)
+            self.setPen(pen)
+        elif isinstance(self, QGraphicsTextItem):
+            self.setDefaultTextColor(color)
+
+    def set_cad_width(self, width):
+        self.cad_width = width
+        if hasattr(self, 'setPen') and not isinstance(self, QGraphicsTextItem):
+            pen = self.pen()
+            # 線の太さが極端に細い場合に消えないよう、最低幅を保証し、かつ拡大縮小の影響を受けにくいCosmeticを設定
+            pen.setWidthF(max(1.0, width))
+            pen.setCosmetic(True)
+            self.setPen(pen)
+
+    def paint_selection_box(self, painter):
+        if self.isSelected():
+            rect = self.boundingRect()
+            if rect.width() < 1 and rect.height() < 1: return
+            lod = QStyleOptionGraphicsItem.levelOfDetailFromTransform(painter.worldTransform())
+            pen_w = 1.0 / lod if lod > 0 else 1.0
+            painter.setPen(QPen(QColor("#FF5722"), pen_w, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(rect)
+
+class CadLineItem(QGraphicsLineItem, CadBase):
+    def __init__(self, x1, y1, x2, y2, color, layer, width=1, node_id=None):
+        super().__init__(x1, y1, x2, y2)
+        self.init_cad(color, layer, node_id)
+        self.set_cad_width(width)
+        self.setPen(QPen(self.cad_color, width))
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        self.paint_selection_box(painter)
+
+class CadPolylineItem(QGraphicsPathItem, CadBase):
+    def __init__(self, points, is_closed, color, layer, width=1, node_id=None):
+        super().__init__()
+        self.init_cad(color, layer, node_id)
+        self.points_data = points
+        self.is_closed = is_closed
+        self.set_cad_width(width)
+        path = QPainterPath()
+        if points:
+            path.moveTo(points[0].x(), points[0].y())
+            for p in points[1:]: path.lineTo(p.x(), p.y())
+            if is_closed: path.closeSubpath()
+        self.setPath(path)
+        self.setPen(QPen(self.cad_color, width))
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        self.paint_selection_box(painter)
+
+class CadEllipseItem(QGraphicsEllipseItem, CadBase):
+    def __init__(self, x, y, w, h, color, layer, width=1, node_id=None):
+        super().__init__(x, y, w, h)
+        self.init_cad(color, layer, node_id)
+        self.set_cad_width(width)
+        self.setPen(QPen(self.cad_color, width))
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        self.paint_selection_box(painter)
+
+class CadArcItem(QGraphicsPathItem, CadBase):
+    def __init__(self, x, y, w, h, start_angle, span, color, layer, width=1, node_id=None):
+        super().__init__()
+        self.init_cad(color, layer, node_id)
+        self.arc_rect = QRectF(x, y, w, h)
+        self.start_angle = start_angle
+        self.span = span
+        self.set_cad_width(width)
+        path = QPainterPath()
+        path.arcMoveTo(self.arc_rect, start_angle)
+        path.arcTo(self.arc_rect, start_angle, span)
+        self.setPath(path)
+        self.setPen(QPen(self.cad_color, width))
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        self.paint_selection_box(painter)
+
+class CadPathItem(QGraphicsPathItem, CadBase):
+    def __init__(self, path, color, layer, width=1, node_id=None):
+        super().__init__(path)
+        self.init_cad(color, layer, node_id)
+        self.set_cad_width(width)
+        self.setPen(QPen(self.cad_color, width))
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        self.paint_selection_box(painter)
+
+class CadHatchItem(QGraphicsPathItem, CadBase):
+    def __init__(self, path, color, layer, node_id=None):
+        super().__init__(path)
+        self.init_cad(color, layer, node_id)
+        self.setBrush(QBrush(self.cad_color))
+        self.setPen(Qt.PenStyle.NoPen)
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        self.paint_selection_box(painter)
+
+class CadTextItem(QGraphicsTextItem, CadBase):
+    def __init__(self, text, x, y, size, color, layer, rotation=0, alignment=Qt.AlignmentFlag.AlignLeft, node_id=None):
+        super().__init__()
+        self.init_cad(color, layer, node_id)
+        self.text_size = size
+        self.setDefaultTextColor(self.cad_color)
+        f = self.font()
+        f.setPointSizeF(size if size > 0 else 10)
+        self.setFont(f)
+        self._set_text(text)
+        self.setPos(x, y)
+        self.setRotation(rotation)
+        # 簡易的なアライメント対応
+        if alignment & Qt.AlignmentFlag.AlignRight:
+            self.setPos(x - self.boundingRect().width(), y)
+        elif alignment & Qt.AlignmentFlag.AlignHCenter:
+            self.setPos(x - self.boundingRect().width() / 2, y)
+
+    def _set_text(self, text):
+        self.setHtml(f"<div>{text.replace(chr(10), '<br>')}</div>")
+
+    def paint(self, painter, option, widget=None):
+        option.state &= ~QStyle.StateFlag.State_Selected
+        super().paint(painter, option, widget)
+        self.paint_selection_box(painter)
+
+# === Scene ===
+
 class FlowchartScene(QGraphicsScene):
     def __init__(self, main_window):
         super().__init__(main_window)
@@ -501,6 +656,7 @@ class FlowchartScene(QGraphicsScene):
         self.preview_node = None
         self.preview_items = []
         self.draw_grid = True
+        self.snap_to_grid = True
 
     def hide_preview_node(self):
         try:
@@ -551,11 +707,34 @@ class FlowchartScene(QGraphicsScene):
             try:
                 if not self.preview_items:
                     id_map = {}
+                    
+                    for c in self.main_window.clipboard_data.get("cad_items", []):
+                        ctype = c.get("type")
+                        color, layer = c.get("color", "#000000"), c.get("layer", "0")
+                        item = None
+                        if ctype == "line": item = CadLineItem(c["x1"], c["y1"], c["x2"], c["y2"], color, layer)
+                        elif ctype == "polyline":
+                            pts = [QPointF(p["x"], p["y"]) for p in c["points"]]
+                            item = CadPolylineItem(pts, c["closed"], color, layer)
+                        elif ctype == "ellipse": item = CadEllipseItem(c["rect_x"], c["rect_y"], c["w"], c["h"], color, layer)
+                        elif ctype == "arc": item = CadArcItem(c["rect_x"], c["rect_y"], c["w"], c["h"], c["start_angle"], c["span"], color, layer)
+                        elif ctype == "text": item = CadTextItem(c["text"], 0, 0, c["size"], color, layer)
+                        
+                        if item:
+                            if "transform" in c:
+                                t = c["transform"]
+                                if len(t) == 9: item.setTransform(QTransform(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8]))
+                            item.setOpacity(0.5); item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False); item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False); item.setZValue(1000)
+                            item.orig_x, item.orig_y = c.get("x", 0), c.get("y", 0)
+                            self.addItem(item); self.preview_items.append(item)
+                    
                     for n in self.main_window.clipboard_data.get("nodes", []):
                         node = NodeItem(n["x"], n["y"], n["text"], n["type"], str(uuid.uuid4()), n.get("bg_color", "#E1F5FE"), n.get("text_color", "#000000"), line_color=n.get("line_color"))
                         node.setOpacity(0.5); node.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
                         node.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
                         node.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False); node.setZValue(1000)
+                        node.orig_x, node.orig_y = n["x"], n["y"]
                         self.addItem(node); self.preview_items.append(node); id_map[n["id"]] = node
 
                     for e in self.main_window.clipboard_data.get("edges", []):
@@ -569,6 +748,7 @@ class FlowchartScene(QGraphicsScene):
                                 wp = WaypointItem(w["x"], w["y"], edge)
                                 wp.setOpacity(0.5); wp.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
                                 wp.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False); wp.setZValue(1000)
+                                wp.orig_x, wp.orig_y = w["x"], w["y"]
                                 edge.waypoints.append(wp); self.addItem(wp); self.preview_items.append(wp)
                             src.add_edge(edge); tgt.add_edge(edge)
                             self.addItem(edge); self.preview_items.append(edge); edge.update_position()
@@ -579,8 +759,9 @@ class FlowchartScene(QGraphicsScene):
                     
                     for item in self.preview_items:
                         item.show()
-                        if isinstance(item, NodeItem) or isinstance(item, WaypointItem): 
-                            item.setPos(item.orig_x + dx, item.orig_y + dy)
+                        if isinstance(item, (NodeItem, WaypointItem)) or (hasattr(item, 'is_cad_item') and item.is_cad_item): 
+                            if hasattr(item, 'orig_x') and hasattr(item, 'orig_y'):
+                                item.setPos(item.orig_x + dx, item.orig_y + dy)
                             
                     for item in self.preview_items:
                         if isinstance(item, EdgeItem):
@@ -590,12 +771,19 @@ class FlowchartScene(QGraphicsScene):
 
     def drawBackground(self, painter, rect):
         super().drawBackground(painter, rect)
-        if not self.draw_grid: return
-        painter.setPen(QPen(QColor(200, 200, 200) if self.main_window.is_light_theme else QColor(60, 60, 60), 1, Qt.PenStyle.SolidLine))
+        painter.setPen(QPen(QColor(230, 230, 230) if self.main_window.is_light_theme else QColor(50, 50, 50), 1, Qt.PenStyle.SolidLine))
         left, top = int(rect.left()) - (int(rect.left()) % GRID_SIZE), int(rect.top()) - (int(rect.top()) % GRID_SIZE)
+        
+        # 補助線（薄いグリッド）
         lines = [QLineF(x, rect.top(), x, rect.bottom()) for x in range(left, int(rect.right()), GRID_SIZE)]
         lines.extend([QLineF(rect.left(), y, rect.right(), y) for y in range(top, int(rect.bottom()), GRID_SIZE)])
         painter.drawLines(lines)
+        
+        # 主線 (100pxおきに少し強調)
+        painter.setPen(QPen(QColor(210, 210, 210) if self.main_window.is_light_theme else QColor(70, 70, 70), 1))
+        major_lines = [QLineF(x, rect.top(), x, rect.bottom()) for x in range(left, int(rect.right()), GRID_SIZE * 5) if x % (GRID_SIZE * 5) == 0]
+        major_lines.extend([QLineF(rect.left(), y, rect.right(), y) for y in range(top, int(rect.bottom()), GRID_SIZE * 5) if y % (GRID_SIZE * 5) == 0])
+        painter.drawLines(major_lines)
 
     def mousePressEvent(self, event):
         self.main_window.is_moving = False
@@ -614,9 +802,11 @@ class FlowchartScene(QGraphicsScene):
                     self.clearSelection()
         
         if tool in ["process", "decision", "data", "terminal"] and event.button() == Qt.MouseButton.LeftButton:
-            sx, sy = round(event.scenePos().x()/GRID_SIZE)*GRID_SIZE, round(event.scenePos().y()/GRID_SIZE)*GRID_SIZE
+            pos = event.scenePos()
+            if self.snap_to_grid:
+                pos = QPointF(round(pos.x()/GRID_SIZE)*GRID_SIZE, round(pos.y()/GRID_SIZE)*GRID_SIZE)
             self.clearSelection()
-            node = NodeItem(sx, sy, text="Node", node_type=tool)
+            node = NodeItem(pos.x(), pos.y(), text="Node", node_type=tool)
             if hasattr(self.main_window, 'cb_font'):
                 node.set_font_family(self.main_window.cb_font.currentText())
             self.items_ref.append(node); self.addItem(node); self.main_window.push_undo_state(f"ノード追加 ({tool})")
@@ -676,31 +866,3 @@ class FlowchartScene(QGraphicsScene):
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace): self.main_window.delete_selected_items()
         super().keyPressEvent(event)
-
-class DxfFrameItem(QGraphicsItemGroup):
-    """DXF図面枠を表示するためのグループアイテム"""
-    def __init__(self, entities):
-        super().__init__()
-        for item in entities:
-            self.addToGroup(item)
-        
-        self.setZValue(-100) # かなり後ろに配置
-        self._locked = True
-        self.set_locked(True)
-
-    def set_locked(self, locked):
-        self._locked = locked
-        if locked:
-            self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemHasNoContents) # ヒットテストを無効化に近い状態
-            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
-            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
-        else:
-            self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable | QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
-            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemHasNoContents, False)
-
-    def paint(self, painter, option, widget=None):
-        if not self._locked and self.isSelected():
-            # 選択中は枠線を表示（QGraphicsItemGroupはデフォルトで描画しないため）
-            painter.setPen(QPen(QColor("#FF5722"), 2, Qt.PenStyle.DashLine))
-            painter.drawRect(self.boundingRect())
-        super().paint(painter, option, widget)

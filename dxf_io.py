@@ -1,148 +1,168 @@
-# tsukasamiyashita/dxfflowchartmiya/DxfFlowchartMiya-1559b301efcf479ed8934d5e23d0d8559520cac5/dxf_io.py
 import ezdxf
 import math
-from PyQt6.QtWidgets import QGraphicsLineItem, QGraphicsPathItem, QGraphicsEllipseItem
+from PyQt6.QtWidgets import QGraphicsItemGroup
 from PyQt6.QtCore import Qt, QPointF
-from PyQt6.QtGui import QPainterPath, QPen, QColor
-from graphics import NodeItem, EdgeItem, clip_line_to_node, DxfFrameItem
-import unicodedata
+from PyQt6.QtGui import QColor, QPainterPath, QBrush
+import re
+from ezdxf.path import Command
+from graphics import (NodeItem, EdgeItem, clip_line_to_node, 
+                       CadLineItem, CadPolylineItem, CadEllipseItem, CadArcItem, CadTextItem, CadPathItem, CadHatchItem)
 
-def export_dxf_file(scene, path, version_string, template_path=None):
-    """シーン内のフローチャート要素をDXFファイルとしてエクスポートする"""
-    doc = None
-    offset_x, offset_y = 0, 0
-    scale = 1.0
+def to_qpainterpath(path):
+    """ezdxf.path.Path を PyQt6.QtGui.QPainterPath に変換する"""
+    qpath = QPainterPath()
+    if len(path) == 0: return qpath
     
-    # 図枠アイテムを探す
-    frame_item = None
-    for item in scene.items():
-        if isinstance(item, DxfFrameItem):
-            frame_item = item
-            break
-            
-    if template_path and ezdxf:
-        try:
-            doc = ezdxf.readfile(template_path)
-            if frame_item:
-                # キャンバス上での図枠の移動量と倍率
-                offset_x = frame_item.scenePos().x()
-                offset_y = -frame_item.scenePos().y()
-                scale = frame_item.scale()
-                if scale <= 0: scale = 1.0
-        except Exception as e:
-            print(f"Template load failed: {e}")
-            doc = None
-            
-    if not doc:
-        doc = ezdxf.new(version_string)
-            
+    qpath.moveTo(path.start.x, -path.start.y)
+    for cmd in path:
+        if cmd.type == Command.LINE_TO:
+            qpath.lineTo(cmd.end.x, -cmd.end.y)
+        elif cmd.type == Command.CURVE3_TO:
+            qpath.quadTo(cmd.ctrl.x, -cmd.ctrl.y, cmd.end.x, -cmd.end.y)
+        elif cmd.type == Command.CURVE4_TO:
+            qpath.cubicTo(cmd.ctrl1.x, -cmd.ctrl1.y, cmd.ctrl2.x, -cmd.ctrl2.y, cmd.end.x, -cmd.end.y)
+    if path.is_closed:
+        qpath.closeSubpath()
+    return qpath
+
+def export_scene_to_dxf(scene, path, version_string):
+    doc = ezdxf.new(version_string)
     msp = doc.modelspace()
     
     for layer_name, color in [("FC_NODE", ezdxf.colors.BLUE), ("FC_EDGE", ezdxf.colors.GREEN), ("FC_TEXT", ezdxf.colors.WHITE)]:
         if layer_name not in doc.layers: doc.layers.add(layer_name, color=color)
-    
-    for item in scene.items():
+        
+    def process_item(item):
+        if not item.isVisible(): return
+        
         is_preview = False
         try:
             if item == getattr(scene, 'preview_node', None) or item in getattr(scene, 'preview_items', []): 
                 is_preview = True
         except RuntimeError: pass
-        
-        # 背景レイヤーのDXF要素やプレビュー図形は出力対象外
-        # プレビュー図形は出力対象外
-        if is_preview: 
-            continue
-        
+        if is_preview: return
+
+        if type(item) == QGraphicsItemGroup:
+            for child in item.childItems():
+                process_item(child)
+            return
+
+        trans = item.sceneTransform()
+
         if isinstance(item, NodeItem):
-            # 図枠の移動分を差し引いて倍率で補正し、元のDXF座標系に合わせる
-            pos = item.scenePos()
-            raw_x, raw_y = (pos.x() - offset_x) / scale, (-pos.y() - offset_y) / scale
-            
-            x, y = raw_x, raw_y
+            hw, hh = item.w / 2, item.h / 2
             t = item.node_type
-            # 図形自体のサイズもDXF座標系（実寸）に合わせるために倍率で割る
-            hw, hh = (item.w / 2) / scale, (item.h / 2) / scale
+            
             if t == "process": 
-                coords = [(x-hw, y+hh), (x+hw, y+hh), (x+hw, y-hh), (x-hw, y-hh)]
+                coords = [QPointF(-hw, hh), QPointF(hw, hh), QPointF(hw, -hh), QPointF(-hw, -hh)]
             elif t == "decision": 
-                dw, dh = hw + (10 / scale), hh + (10 / scale)
-                coords = [(x, y+dh), (x+dw, y), (x, y-dh), (x-dw, y)]
+                dw, dh = hw + 10, hh + 10
+                coords = [QPointF(0, dh), QPointF(dw, 0), QPointF(0, -dh), QPointF(-dw, 0)]
             elif t == "data":
                 skew = hh
-                coords = [(x-hw+skew/2, y+hh), (x+hw+skew/2, y+hh), (x+hw-skew/2, y-hh), (x-hw-skew/2, y-hh)]
+                coords = [QPointF(-hw+skew/2, hh), QPointF(hw+skew/2, hh), QPointF(hw-skew/2, -hh), QPointF(-hw-skew/2, -hh)]
             elif t == "terminal":
-                coords = [(x-hw+hh, y+hh), (x+hw-hh, y+hh), (x+hw, y+hh/2), (x+hw, y-hh/2), (x+hw-hh, y-hh), (x-hw+hh, y-hh), (x-hw, y-hh/2), (x-hw, y+hh/2)]
+                coords = [QPointF(-hw+hh, hh), QPointF(hw-hh, hh), QPointF(hw, hh/2), QPointF(hw, -hh/2), QPointF(hw-hh, -hh), QPointF(-hw+hh, -hh), QPointF(-hw, -hh/2), QPointF(-hw, hh/2)]
             else: 
-                coords = [(x-hw, y+hh), (x+hw, y+hh), (x+hw, y-hh), (x-hw, y-hh)]
+                coords = [QPointF(-hw, hh), QPointF(hw, hh), QPointF(hw, -hh), QPointF(-hw, -hh)]
                 
-            msp.add_lwpolyline(coords, close=True, dxfattribs={'layer': 'FC_NODE'})
+            scene_coords = [trans.map(p) for p in coords]
+            dxf_coords = [(p.x(), -p.y()) for p in scene_coords]
+            msp.add_lwpolyline(dxf_coords, close=True, dxfattribs={'layer': 'FC_NODE'})
+            
             if item.text_item.toPlainText():
                 ls = item.text_item.toPlainText().split('\n')
-                # テキストの高さ・位置も倍率で割る
-                base_h = 12 / scale
-                line_spacing = 15 / scale
-                sy = y + (len(ls)-1)*(base_h * 0.625) 
+                base_h = 12
+                line_spacing = 15
                 for i, l in enumerate(ls): 
-                    msp.add_text(l, dxfattribs={'height': base_h, 'layer': 'FC_TEXT'}).set_placement((x, sy-i*line_spacing), align=ezdxf.enums.TextEntityAlignment.MIDDLE_CENTER)
+                    ly = (len(ls)-1)*(-line_spacing/2) + i*line_spacing
+                    sp = trans.map(QPointF(0, ly))
+                    msp.add_text(l, dxfattribs={'height': base_h, 'layer': 'FC_TEXT'}).set_placement((sp.x(), -sp.y()), align=ezdxf.enums.TextEntityAlignment.MIDDLE_CENTER)
                     
         elif isinstance(item, EdgeItem):
-            # 座標計算時に図枠のオフセットと倍率を考慮
-            src_pos = item.source_node.scenePos()
-            tgt_pos = item.target_node.scenePos()
+            pts = [item.source_node.scenePos()] + [wp.scenePos() for wp in item.waypoints] + [item.target_node.scenePos()]
+            p0 = clip_line_to_node(pts[0], pts[1], item.source_node) if len(pts)>1 else pts[0]
+            pn = clip_line_to_node(pts[-1], pts[-2], item.target_node) if len(pts)>1 else pts[-1]
             
-            # ウェイポイントがある場合の最初と最後のセグメント
-            p0 = src_pos
-            p1 = item.waypoints[0].scenePos() if item.waypoints else tgt_pos
-            p_last = item.waypoints[-1].scenePos() if item.waypoints else src_pos
-            pn = tgt_pos
-            
-            cp0 = clip_line_to_node(p0, p1, item.source_node)
-            cpn = clip_line_to_node(pn, p_last, item.target_node)
-            
-            # DXF座標系に変換
-            pts = [QPointF((cp0.x() - offset_x) / scale, (-cp0.y() - offset_y) / scale)]
+            dxf_pts = [(p0.x(), -p0.y())]
             for wp in item.waypoints:
-                wp_pos = wp.scenePos()
-                pts.append(QPointF((wp_pos.x() - offset_x) / scale, (-wp_pos.y() - offset_y) / scale))
-            pts.append(QPointF((cpn.x() - offset_x) / scale, (-cpn.y() - offset_y) / scale))
-                
-            for i in range(len(pts)-1): 
-                msp.add_line((pts[i].x(), pts[i].y()), (pts[i+1].x(), pts[i+1].y()), dxfattribs={'layer': 'FC_EDGE'})
+                dxf_pts.append((wp.scenePos().x(), -wp.scenePos().y()))
+            dxf_pts.append((pn.x(), -pn.y()))
+            
+            for i in range(len(dxf_pts)-1):
+                msp.add_line(dxf_pts[i], dxf_pts[i+1], dxfattribs={'layer': 'FC_EDGE'})
                 
             if item.raw_text:
                 pos = item.get_auto_text_pos() + (item.text_item.manual_offset if item.text_item.manual_offset else QPointF(0,0))
-                # テキスト位置とサイズを倍率で補正
-                mx = (pos.x() - offset_x + item.text_item.boundingRect().width()/2) / scale
-                my = (-(pos.y() + item.text_item.boundingRect().height()/2) - offset_y) / scale
-                
+                mx = pos.x() + item.text_item.boundingRect().width()/2
+                my = pos.y() + item.text_item.boundingRect().height()/2
                 ls = item.raw_text.split('\n')
-                base_h = 10 / scale
-                line_spacing = 12 / scale
-                sy = my + (len(ls)-1)*(base_h * 0.6)
+                base_h = 10
+                line_spacing = 12
                 for i, l in enumerate(ls): 
-                    msp.add_text(l, dxfattribs={'height': base_h, 'layer': 'FC_TEXT'}).set_placement((mx, sy-i*line_spacing), align=ezdxf.enums.TextEntityAlignment.MIDDLE_CENTER)
+                    ly = my - (len(ls)-1)*(line_spacing/2) + i*line_spacing
+                    msp.add_text(l, dxfattribs={'height': base_h, 'layer': 'FC_TEXT'}).set_placement((mx, -ly), align=ezdxf.enums.TextEntityAlignment.MIDDLE_CENTER)
                     
+            def draw_arrow(p1, p2):
+                angle = math.atan2(p2.y() - p1.y(), p2.x() - p1.x())
+                arrow_size = 12 + item.line_width * 1.5
+                ap1 = p2 - QPointF(math.cos(angle + math.pi / 6) * arrow_size, math.sin(angle + math.pi / 6) * arrow_size)
+                ap2 = p2 - QPointF(math.cos(angle - math.pi / 6) * arrow_size, math.sin(angle - math.pi / 6) * arrow_size)
+                msp.add_lwpolyline([(p2.x(), -p2.y()), (ap1.x(), -ap1.y()), (ap2.x(), -ap2.y())], close=True, dxfattribs={'layer': 'FC_EDGE'})
+
             if item.arrow in ["end", "both"] and hasattr(item, 'arrow_p1') and hasattr(item, 'arrow_p2'):
-                ap2_raw = QPointF((item.arrow_p2.x() - offset_x) / scale, (-item.arrow_p2.y() - offset_y) / scale)
-                angle = math.atan2(item.arrow_p2.y() - item.arrow_p1.y(), item.arrow_p2.x() - item.arrow_p1.x())
-                # 矢印サイズも倍率で割る
-                arrow_size = (12 + item.line_width * 1.5) / scale
-                ap1 = ap2_raw - QPointF(math.cos(angle + math.pi / 6) * arrow_size, -math.sin(angle + math.pi / 6) * arrow_size)
-                ap2 = ap2_raw - QPointF(math.cos(angle - math.pi / 6) * arrow_size, -math.sin(angle - math.pi / 6) * arrow_size)
-                msp.add_lwpolyline([(ap2_raw.x(), ap2_raw.y()), (ap1.x(), ap1.y()), (ap2.x(), ap2.y())], close=True, dxfattribs={'layer': 'FC_EDGE'})
-            
+                draw_arrow(item.arrow_p1, item.arrow_p2)
             if item.arrow in ["start", "both"] and hasattr(item, 'start_arrow_p1') and hasattr(item, 'start_arrow_p2'):
-                ap2_raw = QPointF((item.start_arrow_p2.x() - offset_x) / scale, (-item.start_arrow_p2.y() - offset_y) / scale)
-                angle = math.atan2(item.start_arrow_p2.y() - item.start_arrow_p1.y(), item.start_arrow_p2.x() - item.start_arrow_p1.x())
-                arrow_size = (12 + item.line_width * 1.5) / scale
-                ap1 = ap2_raw - QPointF(math.cos(angle + math.pi / 6) * arrow_size, -math.sin(angle + math.pi / 6) * arrow_size)
-                ap2 = ap2_raw - QPointF(math.cos(angle - math.pi / 6) * arrow_size, -math.sin(angle - math.pi / 6) * arrow_size)
-                msp.add_lwpolyline([(ap2_raw.x(), ap2_raw.y()), (ap1.x(), ap1.y()), (ap2.x(), ap2.y())], close=True, dxfattribs={'layer': 'FC_EDGE'})
+                draw_arrow(item.start_arrow_p1, item.start_arrow_p2)
+
+        elif hasattr(item, 'is_cad_item') and item.is_cad_item:
+            layer = item.cad_layer if hasattr(item, 'cad_layer') else "0"
+            if layer not in doc.layers:
+                doc.layers.add(layer)
+            
+            dxf_attribs = {'layer': layer}
+            r, g, b = item.cad_color.red(), item.cad_color.green(), item.cad_color.blue()
+            dxf_attribs['true_color'] = ezdxf.colors.rgb2int((r, g, b))
+            
+            if isinstance(item, CadLineItem):
+                p1 = trans.map(item.line().p1())
+                p2 = trans.map(item.line().p2())
+                msp.add_line((p1.x(), -p1.y()), (p2.x(), -p2.y()), dxfattribs=dxf_attribs)
                 
+            elif isinstance(item, CadPolylineItem):
+                dxf_pts = [(trans.map(p).x(), -trans.map(p).y()) for p in item.points_data]
+                msp.add_lwpolyline(dxf_pts, close=item.is_closed, dxfattribs=dxf_attribs)
+                
+            elif isinstance(item, CadEllipseItem):
+                center_scene = trans.map(item.rect().center())
+                rx = item.rect().width() / 2 * math.sqrt(trans.m11()**2 + trans.m12()**2)
+                msp.add_circle((center_scene.x(), -center_scene.y()), rx, dxfattribs=dxf_attribs)
+                
+            elif isinstance(item, CadArcItem):
+                center_scene = trans.map(item.arc_rect.center())
+                rx = item.arc_rect.width() / 2 * math.sqrt(trans.m11()**2 + trans.m12()**2)
+                sa = 360 - (item.start_angle + item.span)
+                ea = 360 - item.start_angle
+                if sa < 0: sa += 360
+                if ea < 0: ea += 360
+                msp.add_arc((center_scene.x(), -center_scene.y()), rx, sa, ea, dxfattribs=dxf_attribs)
+                
+            elif isinstance(item, CadTextItem):
+                local_pos = QPointF(0, item.text_size)
+                scene_pos = trans.map(local_pos)
+                height = item.text_size * math.sqrt(trans.m22()**2 + trans.m21()**2)
+                if height <= 0: height = 12
+                dxf_attribs['height'] = height
+                msp.add_text(item.toPlainText(), dxfattribs=dxf_attribs).set_placement((scene_pos.x(), -scene_pos.y()))
+
+    for item in scene.items():
+        if item.parentItem() is None:
+            process_item(item)
+
     doc.saveas(path)
 
 def import_dxf_as_items(path):
-    """DXFファイルを読み込み、QGraphicsItem のリストとして返す"""
+    """DXFファイルを読み込み、高精度なCADアイテムのリストとして返す"""
     if not ezdxf: return []
     try:
         doc = ezdxf.readfile(path)
@@ -151,78 +171,98 @@ def import_dxf_as_items(path):
         return []
         
     msp = doc.modelspace()
-    from PyQt6.QtWidgets import QGraphicsLineItem, QGraphicsPathItem, QGraphicsEllipseItem, QGraphicsTextItem
-    from PyQt6.QtGui import QPen, QColor, QPainterPath
-    from PyQt6.QtCore import Qt, QRectF
-    
     items = []
-    
-    for entity in msp:
-        # カラー取得 (ACI -> RGB)
-        color = QColor(Qt.GlobalColor.gray) # デフォルト
-        if entity.dxf.color < 256:
+
+    def get_color(entity):
+        true_color = entity.dxf.get('true_color')
+        if true_color is not None:
             try:
-                # ezdxf での ACI から RGB への標準的な変換
-                r, g, b = ezdxf.colors.aci2rgb(entity.dxf.color)
-                color = QColor(r, g, b)
-            except Exception:
+                rgb = ezdxf.colors.int2rgb(true_color)
+                return QColor(rgb[0], rgb[1], rgb[2])
+            except: pass
+        
+        aci_color = entity.dxf.get('color', 256)
+        if aci_color == 256: # ByLayer
+            layer_obj = doc.layers.get(entity.dxf.layer)
+            aci_color = layer_obj.color if layer_obj else 7
+        
+        if aci_color < 256:
+            try:
+                r, g, b = ezdxf.colors.aci2rgb(aci_color)
+                return QColor(r, g, b)
+            except: pass
+        return QColor(Qt.GlobalColor.black)
+
+    def get_width(entity):
+        # lineweightは1/100mm単位。デフォルトを1とする。
+        lw = entity.dxf.get('lineweight', -1)
+        if lw <= 0: return 1.0
+        return max(0.1, lw / 25.0) # 簡易的なスケーリング
+
+    def process_entities(entities):
+        for entity in entities:
+            try:
+                # INSERT (ブロック参照) の場合は展開して再帰的に処理する
+                if entity.dxftype() == 'INSERT':
+                    # virtual_entities() はすべての変換（位置、回転、スケール）を適用した状態で子要素を返す
+                    process_entities(entity.virtual_entities())
+                    continue
+
+                etype = entity.dxftype()
+                color = get_color(entity)
+                layer = entity.dxf.layer
+                width = get_width(entity)
+
+                if etype in ('TEXT', 'MTEXT'):
+                    if etype == 'TEXT':
+                        txt = entity.dxf.text
+                        pos = entity.dxf.insert if not entity.dxf.hasattr('align_point') else entity.dxf.align_point
+                    else:
+                        # MTEXTの書式コードを除去し、改行を適切に処理
+                        txt = re.sub(r'\\[a-zA-Z0-9]+|{[^{}]*}', '', entity.text)
+                        pos = entity.dxf.insert
+                    
+                    height = entity.dxf.get('height', 10)
+                    rot = entity.dxf.get('rotation', 0)
+                    
+                    # アライメント
+                    align = Qt.AlignmentFlag.AlignLeft
+                    if etype == 'TEXT':
+                        h, v = entity.dxf.get('halign', 0), entity.dxf.get('valign', 0)
+                        if h == 1: align |= Qt.AlignmentFlag.AlignHCenter
+                        elif h == 2: align |= Qt.AlignmentFlag.AlignRight
+                        if v == 1: align |= Qt.AlignmentFlag.AlignBottom
+                        elif v == 2: align |= Qt.AlignmentFlag.AlignVCenter
+                        elif v == 3: align |= Qt.AlignmentFlag.AlignTop
+                    else:
+                        att = entity.dxf.get('attachment_point', 1)
+                        if att in (2, 5, 8): align |= Qt.AlignmentFlag.AlignHCenter
+                        elif att in (3, 6, 9): align |= Qt.AlignmentFlag.AlignRight
+                        if att in (4, 5, 6): align |= Qt.AlignmentFlag.AlignVCenter
+                        elif att in (7, 8, 9): align |= Qt.AlignmentFlag.AlignBottom
+                        else: align |= Qt.AlignmentFlag.AlignTop
+
+                    item = CadTextItem(txt, pos.x, -pos.y, height, color, layer, rotation=-rot, alignment=align)
+                    items.append(item)
+                    continue
+
+                # 図形要素 (LINE, CIRCLE, ARC, SPLINE等)
+                if etype == 'LINE':
+                    if entity.dxf.start.isclose(entity.dxf.end, abs_tol=1e-5): continue
+                
+                # make_path は複雑な図形も高精度のベジェ/ラインパスに変換する
+                paths = ezdxf.path.make_path(entity)
+                for p in paths:
+                    qpath = to_qpainterpath(p)
+                    if qpath.length() < 0.005: continue
+                        
+                    if etype == 'HATCH' and entity.dxf.get('solid_fill', 0):
+                        items.append(CadHatchItem(qpath, color, layer))
+                    else:
+                        items.append(CadPathItem(qpath, color, layer, width))
+            except Exception as e:
+                # 個別のアイテム失敗で全体を止めない
                 pass
-        
-        pen = QPen(color, 1)
-        
-        if entity.dxftype() == 'LINE':
-            start, end = entity.dxf.start, entity.dxf.end
-            line = QGraphicsLineItem(start.x, -start.y, end.x, -end.y)
-            line.setPen(pen)
-            items.append(line)
-            
-        elif entity.dxftype() == 'LWPOLYLINE':
-            path = QPainterPath()
-            pts = entity.get_points()
-            if pts:
-                path.moveTo(pts[0][0], -pts[0][1])
-                for i in range(1, len(pts)):
-                    path.lineTo(pts[i][0], -pts[i][1])
-                if entity.closed:
-                    path.closeSubpath()
-            p_item = QGraphicsPathItem(path)
-            p_item.setPen(pen)
-            items.append(p_item)
-            
-        elif entity.dxftype() == 'CIRCLE':
-            center = entity.dxf.center
-            radius = entity.dxf.radius
-            ellipse = QGraphicsEllipseItem(center.x - radius, -center.y - radius, radius * 2, radius * 2)
-            ellipse.setPen(pen)
-            items.append(ellipse)
-            
-        elif entity.dxftype() == 'ARC':
-            center = entity.dxf.center
-            radius = entity.dxf.radius
-            start_angle = entity.dxf.start_angle
-            end_angle = entity.dxf.end_angle
-            path = QPainterPath()
-            span = end_angle - start_angle
-            if span < 0: span += 360
-            # Qtの角度は反時計回り、0度は右方向、DXFも同様だがY反転に注意
-            # ezdxf の ARC は反時計回り。
-            # QPainterPath.arcTo(rect, startAngle, sweepLength)
-            path.arcMoveTo(center.x - radius, -center.y - radius, radius * 2, radius * 2, start_angle)
-            path.arcTo(center.x - radius, -center.y - radius, radius * 2, radius * 2, start_angle, span)
-            a_item = QGraphicsPathItem(path)
-            a_item.setPen(pen)
-            items.append(a_item)
-            
-        elif entity.dxftype() == 'TEXT':
-            txt = entity.dxf.text
-            pos = entity.dxf.insert
-            t_item = QGraphicsTextItem(txt)
-            t_item.setDefaultTextColor(color)
-            f = t_item.font()
-            f.setPointSizeF(entity.dxf.height * 0.75) # 簡易的なスケール調整
-            t_item.setFont(f)
-            t_item.setPos(pos.x, -pos.y)
-            items.append(t_item)
-            
+
+    process_entities(msp)
     return items
-
